@@ -4,7 +4,15 @@
  * $Id$
  */
 
-  uses('xp.scriptlet.Runner', 'handlers.AbstractUrlHandler');
+  uses(
+    'xp.scriptlet.Runner',
+    'handlers.AbstractUrlHandler',
+    'peer.Socket',
+    'peer.URL',
+    'scriptlet.HttpScriptletRequest',
+    'scriptlet.HttpScriptletResponse',
+    'scriptlet.HttpScriptletException'
+  );
 
   /**
    * Scriptlet handler
@@ -59,6 +67,13 @@
       $request->env['HTTP_HOST']= $url->getHost();
       if ('https' === $url->getScheme()) { 
         $request->env['HTTPS']= 'on';
+      }
+      if (isset($headers['Authorization'])) {
+        if (0 === strncmp('Basic', $headers['Authorization'], 5)) {
+          $credentials= explode(':', base64_decode(substr($headers['Authorization'], 6)));
+          $request->env['PHP_AUTH_USER']= $credentials[0];
+          $request->env['PHP_AUTH_PW']= $credentials[1];
+        }
       }
       $request->setHeaders($headers);
       

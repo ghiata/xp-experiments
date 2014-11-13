@@ -39,7 +39,6 @@
     #[@arg(position= 0)]
     public function setOrigin($dir) {
       $this->base= new FileCollection(new Folder($dir));
-      ClassLoader::getDefault()->registerPath($this->base->getURI());
     }
 
     /**
@@ -48,8 +47,12 @@
      * @param   string
      */
     #[@arg(position= 1)]
-    public function setTarget($dir) {
-      $this->target= new Folder($dir);
+    public function setTarget($dir= null) {
+      if (null === $dir) {
+        $this->target= new Folder($this->base->getURI());
+      } else {
+        $this->target= new Folder($dir);
+      }
     }
     
     /**
@@ -102,20 +105,35 @@
       // PHP classes are global
       if (0 === strncmp($qualified, 'php\\', 4)) {
         if (!class_exists($local, FALSE) && !interface_exists($local, FALSE)) {
-          throw new IllegalStateException(sprintf(
-            'In %s: Cannot resolve name "%s" namespace "%s", imports= %s',
+          Console::$err->writeLinef(
+            'In %s: Cannot resolve name "%s", assuming namespace "%s" (imports= %s)',
             $context,
             $local,
             $namespace,
             xp::stringOf($imports)
-          ));
+          );
+          return $local;
         }
         return '\\'.$local;
       }
 
-      // If name is in current namespace, use local, else globally qualified version
-      if (0 === strncmp($qualified, $namespace, strlen($namespace))) return $local;
-      return '\\'.$qualified;
+      return $this->declarationOf($namespace, $qualified);
+    }
+
+    /**
+     * Returns declaration of a qualified name. If name is in current 
+     * namespace, use local, else globally qualified version
+     *
+     * @param  string $namespace
+     * @param  string $qualified
+     * @return string
+     */
+    protected function declarationOf($namespace, $qualified) {
+      if (0 === strncmp($qualified, $namespace, strlen($namespace))) {
+        return substr($qualified, strrpos($qualified, '\\'));
+      } else {
+        return '\\'.$qualified;
+      }
     }
     
     /**
@@ -124,8 +142,12 @@
      * @param   io.collections.IOElement e
      */
     protected function process(IOElement $e) {
+
+      // Read input file
       $base= strlen($this->base->getURI());
-      $relative= substr($e->getOrigin()->getURI(), $base, -1);
+      $path= $e->getOrigin()->getURI();
+      $relative= substr($path, $base, -1);
+      $bytes= Streams::readAll($e->getInputStream());
 
       // Ensure output folder exists
       $folder= new Folder($this->target, $relative);
@@ -134,25 +156,50 @@
       // Create output file
       $target= new File($this->target, substr($e->getURI(), $base));
       $out= $target->getOutputStream();
-      
+
+      // Check the file is not already namespaced.
+      if (preg_match('/namespace [a-z0-9_\\\\]+;/', $bytes)) {
+        $out->write($bytes);
+        $out->close();
+        return FALSE;
+      }
+
+      // Calculate namespace
+      $namespace= NULL;
+      foreach (ClassLoader::getLoaders() as $delegate) {
+        $l= strlen($delegate->path);
+        if (0 === strncmp($path, $delegate->path, $l)) {
+          $namespace= rtrim(strtr(substr($path, $l), DIRECTORY_SEPARATOR, '\\'), '\\');
+          break;
+        }
+      }
+
       // Initialize
       $context= $e->getURI();
       $imports= array();
-      $namespace= strtr($relative, DIRECTORY_SEPARATOR, '\\');
-      $tokens= token_get_all(Streams::readAll($e->getInputStream()));
-      $declared= FALSE;
+      $tokens= token_get_all($bytes);
       $state= self::ST_INITIAL;
       $cl= ClassLoader::getDefault();
 
       // Handle tokens
       for ($i= 0, $s= sizeof($tokens); $i < $s; $i++) {
         switch ($state.$tokens[$i][0]) {
+          case self::ST_INITIAL.T_OPEN_TAG:
+            $out->write('<?php');
+            $namespace && $out->write(' namespace '.$namespace.';');
+            break;
+
+          case self::ST_INITIAL.T_COMMENT:
+            if (0 === strncmp('/* This class is part', $tokens[$i][1], 21)) {
+              // Skip comment
+            } else {
+              $out->write(str_replace("\n  ", "\n", $tokens[$i][1]));
+            }
+            break;
+
           case self::ST_INITIAL.T_STRING:
             if ('uses' === $tokens[$i][1]) {
               $state= self::ST_USES;
-              $namespace && $out->write('namespace '.$namespace.";\n  ");
-              $declared= TRUE;
-              $out->write('use');
             } else {
               $out->write($tokens[$i][1]);
             }
@@ -166,11 +213,11 @@
             }
             break;
 
-          case self::ST_USES.'(': 
-            $out->write(' ');
+          case self::ST_USES.'(': case self::ST_USES.',': case self::ST_USES.')': case self::ST_USES.T_WHITESPACE:
+            // Skip
             break;
 
-          case self::ST_USES.')':
+          case self::ST_USES.';':
             $state= self::ST_INITIAL;
             break;
           
@@ -178,23 +225,14 @@
             $name= substr($tokens[$i][1], 1, -1);
             $local= substr($name, strrpos($name, '.')+ 1);
             $imports[$local]= $cl->loadClass($name);
-            $out->write(strtr($name, '.', '\\'));
-            break;
-          
-          case self::ST_INITIAL.T_DOC_COMMENT:
-            if (!$declared) {
-              $namespace && $out->write('namespace '.$namespace.";\n\n  ");
-              $declared= TRUE;
+            $qname= strtr($name, '.', '\\');
+            if (0 !== strncmp($qname, $namespace, strlen($namespace))) {
+              $out->write('use '.$qname.";\n");
             }
-            $out->write($tokens[$i][1]);
             break;
 
           case self::ST_INITIAL.T_CLASS:
           case self::ST_INITIAL.T_INTERFACE:
-            if (!$declared) {
-              $namespace && $out->write('namespace '.$namespace.";\n\n  ");
-              $declared= TRUE;
-            }
             $out->write($tokens[$i][1].' ');
             $local= $tokens[$i+ 2][1];
             if (FALSE !== ($p= strrpos($local, '·'))) { // Unqualify RFC#37- qualified class names
@@ -216,12 +254,19 @@
             $out->write('{');
             $state= self::ST_BODY;
             break;
-          
+
+          case self::ST_BODY.T_COMMENT:   // One-line comments swallow ending "\n"
+            $out->write(rtrim($tokens[$i][1], "\r\n"));
+            $tokens[$i+ 1][1]= "\n".$tokens[$i+ 1][1];
+            break;
+
           case self::ST_BODY.T_STRING:
             if (T_DOUBLE_COLON === $tokens[$i+ 1][0]) {
               $out->write($this->nameOf($namespace, $imports, $tokens[$i][1], $context));   // Static method calls
             } else if (T_WHITESPACE === $tokens[$i+ 1][0] && T_VARIABLE === $tokens[$i+ 2][0]) {
               $out->write($this->nameOf($namespace, $imports, $tokens[$i][1], $context));   // Typehint
+            } else if ('TRUE' === $tokens[$i][1] || 'FALSE' === $tokens[$i][1] || 'NULL' === $tokens[$i][1]) {
+              $out->write(strtolower($tokens[$i][1]));
             } else {
               $out->write($tokens[$i][1]);
             }
@@ -234,13 +279,22 @@
               $i+= 2; // Skip over whitespace and class name
             }
             break;
-          
+
+          case self::ST_BODY.T_CLOSE_TAG:
+            // Skip
+            break;
+
           default:
-            $out->write(is_array($tokens[$i]) ? $tokens[$i][1] : $tokens[$i]);
+            if (is_array($tokens[$i])) {
+              $out->write(str_replace("\n  ", "\n", $tokens[$i][1]));
+            } else {
+              $out->write($tokens[$i]);
+            }
         }
       }
       
       $out->close();
+      return TRUE;
     }
 
     /**
@@ -263,8 +317,8 @@
       // Iterate
       $this->out->write('[');
       foreach ($files as $file) {
-        $this->process($file);
-        $this->out->write('.');
+        $processed= $this->process($file);
+        $this->out->write($processed ? '.' : 'S');
       }
       $this->out->writeLine(']');
     }
